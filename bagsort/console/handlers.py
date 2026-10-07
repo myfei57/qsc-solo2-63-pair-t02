@@ -313,6 +313,170 @@ def handle_last_chute(server, request: Request) -> Response:
 
 
 # ---------------------------------------------------------------------------
+# in-transit line tracking
+# ---------------------------------------------------------------------------
+
+
+def handle_line_enter(server, request: Request) -> Response:
+    bag = _plant(server).enter_line(request.param("id"))
+    return json_response(bag.as_dict(), status=201)
+
+
+def handle_line_advance(server, request: Request) -> Response:
+    seconds = request.int_field("seconds", 1)
+    bag = _plant(server).advance_bag(request.param("id"), seconds)
+    return json_response(bag.as_dict())
+
+
+def handle_line_land(server, request: Request) -> Response:
+    record = _plant(server).land_bag(
+        request.param("id"), request.str_field("chute_id")
+    )
+    return json_response(record.as_dict(), status=201)
+
+
+def handle_line_bag(server, request: Request) -> Response:
+    plant = _plant(server)
+    bag = plant.bag(request.param("id"))
+    feasible = None
+    divert_point = None
+    if bag.location.in_transit:
+        target_chute = plant.sorter.route(bag.id).chute_id
+        feasible, _reason, divert_point = plant.line.can_intercept(bag, target_chute)
+    return json_response(
+        {
+            "bag_id": bag.id,
+            "state": bag.state.value,
+            "location": bag.location.value,
+            "mile": bag.mile,
+            "cycle": bag.cycle,
+            "chute_id": bag.chute_id,
+            "flight_id": plant.mapping.flight_of(bag.id),
+            "divert_point": divert_point,
+            "interceptable": feasible,
+        }
+    )
+
+
+def handle_divert_point(server, request: Request) -> Response:
+    plant = _plant(server)
+    chute_id = request.required("chute_id")
+    mile = plant.set_divert_point(chute_id, request.int_field("mile"))
+    return json_response({"chute_id": chute_id, "mile": mile}, status=201)
+
+
+def handle_line_layout(server, request: Request) -> Response:
+    return json_response(_plant(server).line.describe_layout())
+
+
+# ---------------------------------------------------------------------------
+# rebook adjudication
+# ---------------------------------------------------------------------------
+
+
+def handle_rebook_bag(server, request: Request) -> Response:
+    plant = _plant(server)
+    order, decision = plant.rebook_bag(request.param("id"), request.required("flight_id"))
+    command = plant.rebook.command(order.id)
+    return json_response(
+        {
+            "order": order.as_dict(),
+            "decision": decision.as_dict(),
+            "effective_action": plant.rebook.effective_action(order.id).value,
+            "command": command.as_dict() if command is not None else None,
+        },
+        status=201,
+    )
+
+
+def handle_rebook_orders(server, request: Request) -> Response:
+    plant = _plant(server)
+    return json_response(
+        [
+            {
+                "order": order.as_dict(),
+                "effective_action": plant.rebook.effective_action(order.id).value,
+            }
+            for order in plant.rebook.orders()
+        ]
+    )
+
+
+def handle_rebook_decisions(server, request: Request) -> Response:
+    return json_response(
+        [decision.as_dict() for decision in _plant(server).rebook.decisions()]
+    )
+
+
+def handle_bag_rebook_decisions(server, request: Request) -> Response:
+    return json_response(
+        [
+            decision.as_dict()
+            for decision in _plant(server).rebook.decisions_for_bag(request.param("id"))
+        ]
+    )
+
+
+def handle_rebook_order(server, request: Request) -> Response:
+    plant = _plant(server)
+    order = plant.rebook.get_order(request.param("id"))
+    decision = plant.rebook.decision_for(order.id)
+    command = plant.rebook.command(order.id)
+    return json_response(
+        {
+            "order": order.as_dict(),
+            "decision": decision.as_dict(),
+            "effective_action": plant.rebook.effective_action(order.id).value,
+            "command": command.as_dict() if command is not None else None,
+            "bag": plant.bag(order.bag_id).as_dict(),
+        }
+    )
+
+
+def handle_rebook_outcome(server, request: Request) -> Response:
+    plant = _plant(server)
+    command = plant.report_command(
+        request.param("id"),
+        request.bool_field("accepted", False),
+        request.str_field("detail"),
+    )
+    return json_response(
+        {
+            "command": command.as_dict(),
+            "effective_action": plant.rebook.effective_action(request.param("id")).value,
+        }
+    )
+
+
+def handle_rebook_commands(server, request: Request) -> Response:
+    return json_response(
+        [command.as_dict() for command in _plant(server).rebook.pending_commands()]
+    )
+
+
+def handle_recovery_list(server, request: Request) -> Response:
+    include_done = request.query_str("include_done").lower() in {"1", "true", "yes"}
+    return json_response(
+        [task.as_dict() for task in _plant(server).rebook.recovery_tasks(include_done)]
+    )
+
+
+def handle_recovery_recover(server, request: Request) -> Response:
+    bag = _plant(server).recover_bag(request.param("id"))
+    return json_response(bag.as_dict())
+
+
+def handle_rebook_policy(server, request: Request) -> Response:
+    return json_response(_plant(server).rebook_policy())
+
+
+def handle_rebook_reconciliation(server, request: Request) -> Response:
+    plant = _plant(server)
+    report = plant.rebook_reconciliation()
+    return json_response(report, status=200 if report["ok"] else 409)
+
+
+# ---------------------------------------------------------------------------
 # chutes and assignments
 # ---------------------------------------------------------------------------
 

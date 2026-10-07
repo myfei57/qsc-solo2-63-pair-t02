@@ -21,12 +21,14 @@ from bagsort.flight.mapping import BagMapping
 from bagsort.flight.schedule import ScheduleBoard
 from bagsort.ids import IdFactory
 from bagsort.inject.injector import Injector
+from bagsort.line.tracker import LineTracker
 from bagsort.model.entities import Bag, Flight, Reading, SortRecord
 from bagsort.model.errors import unknown_bag
 from bagsort.ns.chutes import ChuteRegistry
 from bagsort.ns.namespace import Namespace
 from bagsort.ns.topology import handling_line
 from bagsort.quota.quota import QuotaBook
+from bagsort.rebook.service import RebookService
 from bagsort.recheck.queue import RecheckQueue
 from bagsort.reporting.report import PlantReport
 from bagsort.sequence.verdict import VerdictTracker
@@ -67,6 +69,8 @@ class Plant:
     recheck: RecheckQueue
     belt: Belt
     quota: QuotaBook
+    line: LineTracker
+    rebook: RebookService
     audit: AuditChain
     report: PlantReport
 
@@ -105,6 +109,8 @@ class Plant:
         closer = FlightCloser(book)
         recheck = RecheckQueue(store, book, clock)
         belt = Belt(store, clock, IdFactory("cmd"))
+        line = LineTracker(store, clock)
+        rebook = RebookService(store, clock, line, sorter, mapping)
 
         audit = AuditChain(store, clock, handling_line())
         audit_subscriber = _AuditSubscriber(audit)
@@ -117,6 +123,8 @@ class Plant:
             "chute.assigned",
             "belt.switched",
             "bag.remapped",
+            "rebook.decided",
+            "rebook.recovered",
         ):
             bus.subscribe(topic, audit_subscriber)
 
@@ -145,6 +153,8 @@ class Plant:
             recheck=recheck,
             belt=belt,
             quota=quota,
+            line=line,
+            rebook=rebook,
             audit=audit,
             report=report,
         )
@@ -212,6 +222,75 @@ class Plant:
         self.bus.publish("bag.remapped", bag_id=bag_id, flight_id=flight_id)
         return self.bag(bag_id)
 
+    # -- in-transit tracking ----------------------------------------------
+
+    def enter_line(self, bag_id: str) -> Bag:
+        return self.line.enter_line(self.bag(bag_id))
+
+    def advance_bag(self, bag_id: str, seconds: int = 1) -> Bag:
+        return self.line.advance(self.bag(bag_id), seconds)
+
+    def land_bag(self, bag_id: str, chute_id: str = "") -> SortRecord:
+        """Confirm the bag's planned allocation has put it in its chute."""
+
+        bag = self.bag(bag_id)
+        chute = chute_id or self.sorter.route(bag.id).chute_id
+        landed_bag = self.line.land(bag, chute)
+        record = self.sorter.land(
+            landed_bag, mile=self.line.divert_point(chute)
+        )
+        self.bus.publish("bag.sorted", bag_id=bag_id, chute_id=chute, landed=True)
+        return record
+
+    def set_divert_point(self, chute_id: str, mile: int) -> int:
+        return self.line.set_divert_point(chute_id, mile)
+
+    # -- rebook flow -------------------------------------------------------
+
+    def rebook_bag(self, bag_id: str, new_flight_id: str):
+        """Adjudicate a last-minute change and publish the per-bag decision."""
+
+        order = self.rebook.submit(bag_id, new_flight_id)
+        decision = self.rebook.decision_for(order.id)
+        self.bus.publish(
+            "rebook.decided",
+            bag_id=bag_id,
+            rebook_id=order.id,
+            action=decision.action.value,
+            from_flight_id=order.old_flight_id,
+            to_flight_id=new_flight_id,
+            feasible=decision.feasible,
+            target_chute=decision.target_chute,
+        )
+        return order, decision
+
+    def report_command(self, rebook_id: str, accepted: bool, detail: str = ""):
+        command = self.rebook.command_outcome(rebook_id, accepted, detail)
+        if not accepted:
+            self.bus.publish(
+                "rebook.decided",
+                bag_id=command.bag_id,
+                rebook_id=rebook_id,
+                action="continue",
+                feasible=False,
+                rejected=True,
+                target_chute=command.chute_id,
+            )
+        return command
+
+    def recover_bag(self, bag_id: str) -> Bag:
+        bag = self.rebook.recover(bag_id)
+        self.bus.publish("rebook.recovered", bag_id=bag_id, flight_id=bag.flight_id)
+        return bag
+
+    def rebook_reconciliation(self) -> dict[str, object]:
+        report = self.rebook.reconciliation(self.audit.entries())
+        report["audit_intact"] = self.audit.verify()
+        return report
+
+    def rebook_policy(self) -> dict[str, object]:
+        return self.rebook.policy_record()
+
     def revise_schedule(self, flight_id: str, cutoff_at: str):
         return self.schedule.revise(flight_id, cutoff_at)
 
@@ -259,6 +338,10 @@ class _AuditSubscriber:
         "chute.assigned": ("chute_assign", "chute"),
         "belt.switched": ("belt_switch", "belt"),
         "bag.remapped": ("remap", "checkin"),
+        # Rebook decisions read every earlier stage and act as the final
+        # adjudication, so they are recorded at the audit tail of the line.
+        "rebook.decided": ("rebook_decision", "audit"),
+        "rebook.recovered": ("rebook_recovery", "audit"),
     }
 
     def __init__(self, audit: AuditChain) -> None:
