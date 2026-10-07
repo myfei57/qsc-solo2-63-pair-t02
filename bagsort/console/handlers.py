@@ -313,6 +313,143 @@ def handle_last_chute(server, request: Request) -> Response:
 
 
 # ---------------------------------------------------------------------------
+# sortation loop
+# ---------------------------------------------------------------------------
+
+
+def handle_line_enter(server, request: Request) -> Response:
+    tracking = _plant(server).enter_line(request.param("id"))
+    return json_response(tracking, status=201)
+
+
+def handle_line_observe(server, request: Request) -> Response:
+    plant = _plant(server)
+    tracking = plant.observe_bag(
+        request.param("id"), request.int_field("position")
+    )
+    return json_response(tracking)
+
+
+def handle_line_advance(server, request: Request) -> Response:
+    plant = _plant(server)
+    cells = request.int_field("cells", 1)
+    landed = plant.advance_line(cells)
+    return json_response({"cells": cells, "landed": landed})
+
+
+def handle_line_state(server, request: Request) -> Response:
+    tracker = _plant(server).tracker
+    return json_response(
+        {
+            "on_loop": [tracking.as_dict() for tracking in tracker.on_loop()],
+            "length": _plant(server).geometry.length,
+            "margin": _plant(server).geometry.margin,
+        }
+    )
+
+
+def handle_line_bag(server, request: Request) -> Response:
+    plant = _plant(server)
+    bag_id = request.param("id")
+    return json_response(
+        {
+            "bag_id": bag_id,
+            "phase": plant.tracker.phase_of(bag_id).value,
+            "position": plant.tracker.position_of(bag_id),
+        }
+    )
+
+
+def handle_line_chute_cell(server, request: Request) -> Response:
+    plant = _plant(server)
+    plant.set_chute_cell(request.required("chute_id"), request.int_field("cell"))
+    return json_response({"chute_id": request.str_field("chute_id"), "cell": request.int_field("cell")})
+
+
+def handle_line_gateway_strict(server, request: Request) -> Response:
+    plant = _plant(server)
+    plant.set_gateway_strict(request.required("bag_id"), request.str_field("reject", "cancel"))
+    return json_response({"bag_id": request.str_field("bag_id"), "reject": request.str_field("reject", "cancel")})
+
+
+def handle_divert_commands(server, request: Request) -> Response:
+    plant = _plant(server)
+    bag_id = request.query_str("bag_id")
+    commands = plant.controller.for_bag(bag_id) if bag_id else list(plant.store.state().divert_commands.values())
+    return json_response([command.as_dict() for command in commands])
+
+
+# ---------------------------------------------------------------------------
+# rebooks
+# ---------------------------------------------------------------------------
+
+
+def handle_rebook_policy(server, request: Request) -> Response:
+    policy = _plant(server).rebook_policy()
+    if policy is None:
+        return json_response({"error": "not sealed"}, status=404)
+    return json_response(policy)
+
+
+def handle_rebook_preview(server, request: Request) -> Response:
+    plant = _plant(server)
+    return json_response(
+        plant.reroute_preview(request.param("id"), request.required("flight_id"))
+    )
+
+
+def handle_rebook_apply(server, request: Request) -> Response:
+    plant = _plant(server)
+    request_id = request.str_field("request_id")
+    if not request_id:
+        request_id = f"api-{plant.store.watermark + 1}-{request.param('id')}"
+    result = plant.rebook_bag(request.param("id"), request.required("flight_id"), request_id)
+    status = 200 if result.final else 202
+    return json_response(result.as_dict(), status=status)
+
+
+def handle_rebook_order(server, request: Request) -> Response:
+    return json_response(_plant(server).rebooks.order(request.param("id")).as_dict())
+
+
+def handle_rebook_list(server, request: Request) -> Response:
+    plant = _plant(server)
+    bag_id = request.query_str("bag_id")
+    orders = plant.rebooks.orders_for(bag_id) if bag_id else list(plant.store.state().rebook_orders.values())
+    return json_response([order.as_dict() for order in orders])
+
+
+def handle_rebook_pending(server, request: Request) -> Response:
+    plant = _plant(server)
+    return json_response([order.as_dict() for order in plant.rebooks.pending_orders()])
+
+
+def handle_rebook_settle(server, request: Request) -> Response:
+    result = _plant(server).settle_rebook(request.param("id"))
+    status = 200 if result.final else 202
+    return json_response(result.as_dict(), status=status)
+
+
+def handle_rebook_targets(server, request: Request) -> Response:
+    plant = _plant(server)
+    bag_id = request.param("id")
+    return json_response([target.as_dict() for target in plant.targets.for_bag(bag_id)])
+
+
+def handle_rebook_integrity(server, request: Request) -> Response:
+    return json_response(_plant(server).rebook_integrity())
+
+
+def handle_rebook_reconcile(server, request: Request) -> Response:
+    return json_response(_plant(server).rebook_reconcile(request.param("id")))
+
+
+def handle_rebook_reconcile_all(server, request: Request) -> Response:
+    return json_response(_plant(server).rebook_reconcile_all())
+
+
+
+# ---------------------------------------------------------------------------
 # chutes and assignments
 # ---------------------------------------------------------------------------
 

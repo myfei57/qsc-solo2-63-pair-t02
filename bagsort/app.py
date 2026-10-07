@@ -38,6 +38,16 @@ from bagsort.chute.assigner import ChuteAssigner
 from bagsort.chute.history import AssignmentHistory
 from bagsort.console.metrics import Metrics
 from bagsort.console.telemetry import Telemetry
+from bagsort.line.controller import DivertController
+from bagsort.line.enums import TargetStatus
+from bagsort.line.gateway import LineGateway
+from bagsort.line.geometry import LineGeometry
+from bagsort.line.targets import TargetBoard
+from bagsort.line.tracker import LineTracker
+from bagsort.rebook.planner import ReroutePlanner
+from bagsort.rebook.policy import PolicyBook
+from bagsort.rebook.reconcile import Reconciler
+from bagsort.rebook.service import RebookResult, RebookService
 
 DEFAULT_TERMINAL = "T1"
 
@@ -69,6 +79,15 @@ class Plant:
     quota: QuotaBook
     audit: AuditChain
     report: PlantReport
+    geometry: LineGeometry
+    gateway: LineGateway
+    targets: TargetBoard
+    controller: DivertController
+    tracker: LineTracker
+    policies: PolicyBook
+    planner: ReroutePlanner
+    rebooks: RebookService
+    reconciler: Reconciler
 
     @property
     def topology(self):
@@ -117,8 +136,33 @@ class Plant:
             "chute.assigned",
             "belt.switched",
             "bag.remapped",
+            "rebook.induction_swap",
+            "rebook.recalled",
+            "rebook.let_ride",
+            "rebook.policy_sealed",
         ):
             bus.subscribe(topic, audit_subscriber)
+
+        geometry = LineGeometry()
+        gateway = LineGateway()
+        targets = TargetBoard(store, clock)
+        controller = DivertController(store, clock)
+        tracker = LineTracker(store, geometry, controller, gateway, clock, sorter.log)
+        policies = PolicyBook(store, clock)
+        planner = ReroutePlanner(store, tracker, targets, chutes, geometry)
+        rebooks = RebookService(
+            store,
+            clock,
+            book,
+            planner,
+            targets,
+            controller,
+            tracker,
+            gateway,
+            policies,
+            recheck,
+        )
+        reconciler = Reconciler(store)
 
         report = PlantReport(
             store, book, chutes, belt, quota, audit, namespace, handling_line()
@@ -147,6 +191,15 @@ class Plant:
             quota=quota,
             audit=audit,
             report=report,
+            geometry=geometry,
+            gateway=gateway,
+            targets=targets,
+            controller=controller,
+            tracker=tracker,
+            policies=policies,
+            planner=planner,
+            rebooks=rebooks,
+            reconciler=reconciler,
         )
 
     # -- operator operations ----------------------------------------------
@@ -174,11 +227,27 @@ class Plant:
     def check_in(self, barcode: str, flight_id: str) -> Bag:
         bag = self.desk.check_in(barcode, flight_id)
         self.bus.publish("bag.checked_in", bag_id=bag.id, flight_id=flight_id)
+        self._record_initial_target(bag.id, flight_id)
         return bag
+
+    def _record_initial_target(self, bag_id: str, flight_id: str) -> None:
+        """Version the original target so every later target has a predecessor."""
+
+        assignment = self.chutes.current(flight_id)
+        with self.store.session() as session:
+            self.targets.create(
+                session,
+                bag_id,
+                flight_id,
+                assignment.chute_id if assignment else "",
+                TargetStatus.ACTIVE,
+            )
 
     def cancel_check_in(self, bag_id: str) -> Bag:
         bag = self.desk.cancel(bag_id)
         self.bus.publish("bag.diverted", bag_id=bag.id, reason="checkin_cancelled")
+        with self.store.session() as session:
+            self.targets.deactivate(session, bag.id, TargetStatus.DELIVERED)
         return bag
 
     def bag(self, bag_id: str) -> Bag:
@@ -211,6 +280,130 @@ class Plant:
         self.mapping.remap(bag_id, flight_id)
         self.bus.publish("bag.remapped", bag_id=bag_id, flight_id=flight_id)
         return self.bag(bag_id)
+
+    # -- sortation loop and rebooks ---------------------------------------
+
+    def enter_line(self, bag_id: str) -> dict[str, object]:
+        """Move a bag from the induction desk onto the sortation loop."""
+
+        bag = self.bag(bag_id)
+        assignment = self.chutes.require(self.mapping.flight_of(bag_id))
+        tracking = self.tracker.enter(bag, assignment.chute_id)
+        return tracking.as_dict()
+
+    def observe_bag(self, bag_id: str, position: int) -> dict[str, object]:
+        landed = self.tracker.observe(bag_id, position, self._settle_landed)
+        for landed_id in landed:
+            self.bus.publish(
+                "bag.sorted", bag_id=landed_id, chute_id=self.bag(landed_id).chute_id
+            )
+            if landed_id != bag_id:
+                self._settle_landed(landed_id)
+        self._settle_landed(bag_id)
+        tracking = self.tracker.tracking(bag_id)
+        return tracking.as_dict() if tracking else {"bag_id": bag_id, "phase": "landed"}
+
+    def advance_line(self, cells: int = 1) -> list[str]:
+        """Tick the loop; any let-ride order whose bag lands is settled."""
+
+        landed = self.tracker.tick(cells)
+        for bag_id in landed:
+            self.bus.publish("bag.sorted", bag_id=bag_id, chute_id=self.bag(bag_id).chute_id)
+            self._settle_landed(bag_id)
+        return landed
+
+    def set_chute_cell(self, chute_id: str, cell: int) -> None:
+        self.geometry.set_chute_cell(chute_id, cell)
+
+    def set_gateway_strict(self, bag_id: str, reject: str) -> None:
+        """Fault injection: force the next arm or cancel for a bag to NACK."""
+
+        self.gateway.set_strict(bag_id, reject)
+
+    def reroute_preview(self, bag_id: str, flight_id: str) -> dict[str, object]:
+        """The decision the rebook would make, without applying it."""
+
+        return self.planner.evaluate(bag_id, flight_id).as_dict()
+
+    def rebook_bag(self, bag_id: str, flight_id: str, request_id: str) -> RebookResult:
+        """Apply a passenger rebook for one bag and publish its conclusion."""
+
+        result = self.rebooks.rebook(bag_id, flight_id, request_id)
+        self._publish_rebook(result)
+        return result
+
+    def settle_rebook(self, order_id: str) -> RebookResult:
+        """Crash/retry recovery: finish an order left in the prepared state."""
+
+        result = self.rebooks.settle_prepared(order_id)
+        self._publish_rebook(result)
+        return result
+
+    def _settle_landed(self, bag_id: str) -> None:
+        order = self.rebooks.settle_landing(bag_id)
+        if order is not None:
+            self.bus.publish(
+                "bag.recheck_enqueued",
+                bag_id=bag_id,
+                reason="manual_transfer_after_let_ride",
+            )
+            self.bus.publish(
+                "rebook.let_ride",
+                bag_id=bag_id,
+                old_flight_id=order.old_flight_id,
+                new_flight_id=order.new_flight_id,
+                request_id=order.request_id,
+                verdict=order.verdict,
+                landed_chute_id=order.landed_chute_id,
+                reason=order.reason,
+            )
+
+    def _publish_rebook(self, result: RebookResult) -> None:
+        order = result.order
+        if result.policy_sealed:
+            policy = self.policies.current()
+            self.bus.publish(
+                "rebook.policy_sealed",
+                flight_id=order.new_flight_id,
+                policy=policy.name if policy else "",
+                rejected=policy.rejected if policy else "",
+            )
+        if order.status != "settled":
+            return
+        topic = {
+            "swapped_at_induction": "rebook.induction_swap",
+            "recalled": "rebook.recalled",
+            "let_ride": "rebook.let_ride",
+        }.get(order.verdict)
+        if topic is None:
+            return
+        self.bus.publish(
+            topic,
+            bag_id=order.bag_id,
+            old_flight_id=order.old_flight_id,
+            new_flight_id=order.new_flight_id,
+            request_id=order.request_id,
+            verdict=order.verdict,
+            landed_chute_id=order.landed_chute_id,
+            reason=order.reason,
+            position=order.position,
+            recall_point=order.recall_point,
+            divert_at=order.divert_at,
+        )
+
+    def rebook_policy(self) -> dict[str, object] | None:
+        policy = self.policies.current()
+        return policy.as_dict() if policy else None
+
+    def rebook_integrity(self) -> dict[str, object]:
+        return self.reconciler.integrity_report()
+
+    def rebook_reconcile(self, order_id: str) -> dict[str, object]:
+        return self.reconciler.reconcile_order(order_id).as_dict()
+
+    def rebook_reconcile_all(self) -> list[dict[str, object]]:
+        return [item.as_dict() for item in self.reconciler.reconcile_all()]
+
 
     def revise_schedule(self, flight_id: str, cutoff_at: str):
         return self.schedule.revise(flight_id, cutoff_at)
@@ -259,6 +452,10 @@ class _AuditSubscriber:
         "chute.assigned": ("chute_assign", "chute"),
         "belt.switched": ("belt_switch", "belt"),
         "bag.remapped": ("remap", "checkin"),
+        "rebook.induction_swap": ("rebook_induction_swap", "checkin"),
+        "rebook.recalled": ("rebook_recall", "sorter"),
+        "rebook.let_ride": ("rebook_let_ride", "chute"),
+        "rebook.policy_sealed": ("rebook_policy", "audit"),
     }
 
     def __init__(self, audit: AuditChain) -> None:

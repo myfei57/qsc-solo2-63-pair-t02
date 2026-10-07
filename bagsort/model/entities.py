@@ -162,6 +162,8 @@ class SortRecord:
     sequence: int
     epoch: int
     at: str
+    status: str = "landed"
+    note: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -171,6 +173,8 @@ class SortRecord:
             "sequence": self.sequence,
             "epoch": self.epoch,
             "at": self.at,
+            "status": self.status,
+            "note": self.note,
         }
 
     @classmethod
@@ -182,7 +186,18 @@ class SortRecord:
             sequence=int(raw.get("sequence", 0)),
             epoch=int(raw.get("epoch", 0)),
             at=str(raw.get("at", "")),
+            status=str(raw.get("status", "landed")),
+            note=str(raw.get("note", "")),
         )
+
+    @property
+    def effective(self) -> bool:
+        """A landed record that has not been rolled back."""
+
+        return self.status != "rolled_back"
+
+    def evolved(self, **changes: Any) -> "SortRecord":
+        return replace(self, **changes)
 
 
 @dataclass(frozen=True)
@@ -282,4 +297,222 @@ class AuditEntry:
             prev_digest=str(raw.get("prev_digest", "")),
             digest=str(raw.get("digest", "")),
             at=str(raw.get("at", "")),
+        )
+
+
+@dataclass(frozen=True)
+class LineTracking:
+    """Physical position of one bag on the sortation loop."""
+
+    bag_id: str
+    phase: str
+    position: int
+    entered_at: str
+    last_seen_at: str
+    last_seen_position: int
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "bag_id": self.bag_id,
+            "phase": self.phase,
+            "position": self.position,
+            "entered_at": self.entered_at,
+            "last_seen_at": self.last_seen_at,
+            "last_seen_position": self.last_seen_position,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "LineTracking":
+        return cls(
+            bag_id=str(raw["bag_id"]),
+            phase=str(raw.get("phase", "not_entered")),
+            position=int(raw.get("position", 0)),
+            entered_at=str(raw.get("entered_at", "")),
+            last_seen_at=str(raw.get("last_seen_at", "")),
+            last_seen_position=int(raw.get("last_seen_position", 0)),
+        )
+
+    def evolved(self, **changes: Any) -> "LineTracking":
+        return replace(self, **changes)
+
+
+@dataclass(frozen=True)
+class DivertCommand:
+    """The one physical diverter arming that realises one bag target."""
+
+    id: str
+    bag_id: str
+    target_id: str
+    flight_id: str
+    chute_id: str
+    divert_at: int
+    state: str
+    reason: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "bag_id": self.bag_id,
+            "target_id": self.target_id,
+            "flight_id": self.flight_id,
+            "chute_id": self.chute_id,
+            "divert_at": self.divert_at,
+            "state": self.state,
+            "reason": self.reason,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "DivertCommand":
+        return cls(
+            id=str(raw["id"]),
+            bag_id=str(raw["bag_id"]),
+            target_id=str(raw.get("target_id", "")),
+            flight_id=str(raw.get("flight_id", "")),
+            chute_id=str(raw.get("chute_id", "")),
+            divert_at=int(raw.get("divert_at", 0)),
+            state=str(raw.get("state", "armed")),
+            reason=str(raw.get("reason", "")),
+        )
+
+    def evolved(self, **changes: Any) -> "DivertCommand":
+        return replace(self, **changes)
+
+
+@dataclass(frozen=True)
+class BagTarget:
+    """One version of a bag's flight target.
+
+    Each target carries the id of the rebook order that created it (empty for
+    the original check-in target), which lets the audit trail join the policy
+    decision to exactly one mapping change.
+    """
+
+    id: str
+    bag_id: str
+    number: int
+    flight_id: str
+    chute_id: str
+    status: str
+    created_at: str
+    request_id: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "bag_id": self.bag_id,
+            "number": self.number,
+            "flight_id": self.flight_id,
+            "chute_id": self.chute_id,
+            "status": self.status,
+            "created_at": self.created_at,
+            "request_id": self.request_id,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "BagTarget":
+        return cls(
+            id=str(raw["id"]),
+            bag_id=str(raw["bag_id"]),
+            number=int(raw.get("number", 0)),
+            flight_id=str(raw.get("flight_id", "")),
+            chute_id=str(raw.get("chute_id", "")),
+            status=str(raw.get("status", "active")),
+            created_at=str(raw.get("created_at", "")),
+            request_id=str(raw.get("request_id", "")),
+        )
+
+    def evolved(self, **changes: Any) -> "BagTarget":
+        return replace(self, **changes)
+
+
+@dataclass(frozen=True)
+class RebookOrder:
+    """The persisted conclusion of one passenger rebook for one bag."""
+
+    id: str
+    request_id: str
+    bag_id: str
+    old_flight_id: str
+    new_flight_id: str
+    status: str
+    verdict: str
+    phase: str
+    position: int
+    recall_point: int
+    divert_at: int
+    target_id: str
+    command_id: str
+    landed_chute_id: str
+    reason: str
+    at: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "request_id": self.request_id,
+            "bag_id": self.bag_id,
+            "old_flight_id": self.old_flight_id,
+            "new_flight_id": self.new_flight_id,
+            "status": self.status,
+            "verdict": self.verdict,
+            "phase": self.phase,
+            "position": self.position,
+            "recall_point": self.recall_point,
+            "divert_at": self.divert_at,
+            "target_id": self.target_id,
+            "command_id": self.command_id,
+            "landed_chute_id": self.landed_chute_id,
+            "reason": self.reason,
+            "at": self.at,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "RebookOrder":
+        return cls(
+            id=str(raw["id"]),
+            request_id=str(raw.get("request_id", "")),
+            bag_id=str(raw["bag_id"]),
+            old_flight_id=str(raw.get("old_flight_id", "")),
+            new_flight_id=str(raw.get("new_flight_id", "")),
+            status=str(raw.get("status", "settled")),
+            verdict=str(raw.get("verdict", "")),
+            phase=str(raw.get("phase", "")),
+            position=int(raw.get("position", 0)),
+            recall_point=int(raw.get("recall_point", 0)),
+            divert_at=int(raw.get("divert_at", 0)),
+            target_id=str(raw.get("target_id", "")),
+            command_id=str(raw.get("command_id", "")),
+            landed_chute_id=str(raw.get("landed_chute_id", "")),
+            reason=str(raw.get("reason", "")),
+            at=str(raw.get("at", "")),
+        )
+
+    def evolved(self, **changes: Any) -> "RebookOrder":
+        return replace(self, **changes)
+
+
+@dataclass(frozen=True)
+class RebookPolicy:
+    """The sealed line-wide orientation chosen for rebooks."""
+
+    name: str
+    rejected: str
+    rationale: str
+    sealed_at: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "rejected": self.rejected,
+            "rationale": self.rationale,
+            "sealed_at": self.sealed_at,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "RebookPolicy":
+        return cls(
+            name=str(raw.get("name", "")),
+            rejected=str(raw.get("rejected", "")),
+            rationale=str(raw.get("rationale", "")),
+            sealed_at=str(raw.get("sealed_at", "")),
         )
